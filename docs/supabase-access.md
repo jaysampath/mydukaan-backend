@@ -147,6 +147,13 @@ without doing this.
 | `get_receipt(id)` | any member | Server decides what is on the receipt. |
 | `get_stock_snapshot()` | any member | Derived from the ledger every call. |
 | `get_customer_ledger(id)` | any member | The running khata. |
+| `upsert_customer/supplier/raw_material/packed_sku` | OWNER, MANAGER | 0011. Upserts: the client mints the id, so create and edit are one call. |
+| `archive_master(table, id)` | OWNER, MANAGER | Soft. History keeps referencing the row. |
+| `create_purchase(...)` | OWNER, MANAGER | 0011. Creates lines and posts through `receive_purchase`. |
+| `create_packing_run(...)` | OWNER, MANAGER, PACKER | 0012. Derives wastage; refuses a run that would conjure stock. |
+| `schema_contract()` / `describe_sync_schema()` | any / anon | 0009-0010. The client compatibility contract. |
+| `claim_invite(token, name)` | any authed user | 0014. Attaches a user to a business. Enforces `seat_limit`. |
+| `admin_*` (nine functions) | platform operator | 0015. Cross-tenant. See "The operator API" below. |
 
 Every operation takes the record's UUID **from the caller**, so a phone that
 loses signal mid-call can retry safely. `dispatch_order` called twice deducts
@@ -160,6 +167,87 @@ no *new* work can be started. But `sync_push` stays open, because a user whose
 subscription lapsed while their phone was offline must still be able to get the
 work they already did onto the server. Holding it hostage would be a data-lock
 in everything but name.
+
+---
+
+## The operator API
+
+A platform operator is cross-tenant, which the tenant model has no room for:
+`app.current_business_id()` reads the caller's profile, an operator has none, so
+every policy denies. Migration 0013 adds `app.platform_admins` and the
+`app.require_platform_admin()` guard; 0015 adds nine `admin_*` functions.
+
+Those functions are owned by `postgres` and therefore run with `BYPASSRLS` --
+the same sanctioned exception as `bootstrap_business`. **The guard is the whole
+of tenant isolation for that surface.** Two things keep it honest:
+
+1. `supabase/tests/admin_security.sql` asserts that every `admin_*` function's
+   body contains `require_platform_admin`. One that forgets it fails the suite.
+   The assertion is itself tested, by planting a deliberately unguarded function
+   and confirming it is caught.
+2. `scripts/admin-contract-test.mjs` signs in as a real tenant OWNER and calls
+   all nine over HTTP, asserting `42501` on every one.
+
+Rejected alternative: adding `or app.is_platform_admin()` to the fourteen tenant
+policies. That would put the widening inside `sync_pull` too, so a defect in the
+admin check would be fleet-wide tenant leakage rather than a bug in nine named
+functions.
+
+An operator is **not** a super-user of any tenant. Having no profile, they are
+refused by `sync_pull`, `get_stock_snapshot` and every other tenant RPC --
+asserted in the contract test. They administer the platform; they cannot read a
+customer's khata.
+
+`app.platform_admins` has a self-select policy and **no INSERT or UPDATE
+policy**, so no application code path can create or promote an operator. It is
+done by migration or by hand:
+
+```sql
+insert into app.platform_admins (user_id, label)
+select id, 'ops: you@example.com' from auth.users where email = 'you@example.com';
+```
+
+There is still no `service_role` key anywhere in this system. The admin portal
+authenticates as an ordinary Supabase user and calls these with its own JWT.
+
+---
+
+## The client compatibility contract
+
+`app.schema_contract()` returns `{current, min_client}` and `sync_pull` reports
+it on every pull. `min_client` is the oldest client the server still supports;
+the app refuses to sync and prompts for an update when its baked-in
+`SCHEMA_CONTRACT_VERSION` is below it.
+
+This exists because app builds outlive schema changes -- you cannot force a user
+to update -- and because the app now lives in a separate repo, so
+`src/db/schema.ts` and these migrations are no longer one atomic commit.
+`describe_sync_schema()` declares the local schema the server expects, and the
+app repo's `src/db/schema.contract.test.ts` diffs its own schema against it.
+
+**Bump `current` on any wire-shape change. Bump `min_client` only when an old
+client genuinely cannot survive** -- it strands every phone that has not
+updated, so justify it in the migration.
+
+---
+
+## A plpgsql trap worth knowing
+
+For a rowtype variable, `rec IS NOT NULL` is true only when **every** column is
+non-null. It is not the negation of `rec IS NULL`. Writing
+
+```sql
+select * into v_row from app.orders where id = p_id;
+if v_row is not null then   -- WRONG: almost never true
+```
+
+silently never fires, because a found row nearly always has some nullable column
+set. This shipped in `create_order` in Phase 0 and broke its retry-safety
+guarantee: the idempotency check never matched, so a phone retrying after a
+dropped connection got `23505` instead of `created:false`. Fixed in 0016.
+
+Use `FOUND`. `rec IS NULL` for "no row was found" is correct and is fine to keep
+-- when nothing matches, every column is null.
 
 ---
 

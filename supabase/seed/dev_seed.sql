@@ -20,22 +20,84 @@ end
 $$;
 
 -- --------------------------------------------------------------------------
--- Users. Passwords are unusable on purpose -- these accounts exist to be
--- impersonated from SQL via request.jwt.claims, not to be signed into.
+-- Users.
+--
+-- These carry a real bcrypt password so the HTTP contract tests can sign in.
+-- Before this, they had an unusable password and the contract test could only
+-- get a session through anonymous sign-in, which is disabled on this project --
+-- so it could not run at all. Impersonating from SQL via request.jwt.claims
+-- still works and is what the .sql suites use.
+--
+-- DEV ONLY. The password is in the repo on purpose; the guard above is what
+-- stops this file reaching a project where that would matter.
+--
+--   owner.a@dev.local   OWNER  of Test Spice Co
+--   owner.b@dev.local   OWNER  of Rival Traders   (the isolation counterparty)
+--   packer.a@dev.local  PACKER of Test Spice Co
+--   admin@dev.local     platform operator, member of NO business
 -- --------------------------------------------------------------------------
 
+-- The empty strings are load-bearing. GoTrue scans confirmation_token,
+-- recovery_token, email_change and email_change_token_new into non-nullable Go
+-- strings; those columns are nullable with no default, so a row inserted
+-- directly leaves them NULL and every sign-in fails with a 500
+-- "Database error querying schema" that says nothing about the real cause.
 insert into auth.users (
   instance_id, id, aud, role, email, encrypted_password,
-  email_confirmed_at, created_at, updated_at, raw_app_meta_data, raw_user_meta_data
+  email_confirmed_at, created_at, updated_at, raw_app_meta_data, raw_user_meta_data,
+  confirmation_token, recovery_token, email_change, email_change_token_new
 )
 values
   ('00000000-0000-0000-0000-000000000000','11111111-1111-1111-1111-111111111111',
-   'authenticated','authenticated','owner.a@dev.local','-',now(),now(),now(),'{}','{}'),
+   'authenticated','authenticated','owner.a@dev.local',
+   extensions.crypt('devpassword123', extensions.gen_salt('bf')),
+   now(),now(),now(),'{"provider":"email","providers":["email"]}','{}',
+   '', '', '', ''),
   ('00000000-0000-0000-0000-000000000000','22222222-2222-2222-2222-222222222222',
-   'authenticated','authenticated','owner.b@dev.local','-',now(),now(),now(),'{}','{}'),
+   'authenticated','authenticated','owner.b@dev.local',
+   extensions.crypt('devpassword123', extensions.gen_salt('bf')),
+   now(),now(),now(),'{"provider":"email","providers":["email"]}','{}',
+   '', '', '', ''),
   ('00000000-0000-0000-0000-000000000000','33333333-3333-3333-3333-333333333333',
-   'authenticated','authenticated','packer.a@dev.local','-',now(),now(),now(),'{}','{}')
-on conflict (id) do nothing;
+   'authenticated','authenticated','packer.a@dev.local',
+   extensions.crypt('devpassword123', extensions.gen_salt('bf')),
+   now(),now(),now(),'{"provider":"email","providers":["email"]}','{}',
+   '', '', '', ''),
+  ('00000000-0000-0000-0000-000000000000','99999999-9999-9999-9999-999999999999',
+   'authenticated','authenticated','admin@dev.local',
+   extensions.crypt('devpassword123', extensions.gen_salt('bf')),
+   now(),now(),now(),'{"provider":"email","providers":["email"]}','{}',
+   '', '', '', '')
+on conflict (id) do update
+  set encrypted_password     = excluded.encrypted_password,
+      raw_app_meta_data      = excluded.raw_app_meta_data,
+      email_confirmed_at     = excluded.email_confirmed_at,
+      confirmation_token     = '',
+      recovery_token         = '',
+      email_change           = '',
+      email_change_token_new = '';
+
+-- GoTrue resolves a password grant through auth.identities, not auth.users
+-- alone. Without these rows the sign-in returns "Invalid login credentials"
+-- even though the hash is correct.
+insert into auth.identities (
+  provider_id, user_id, identity_data, provider, last_sign_in_at, created_at, updated_at
+)
+select u.id::text, u.id,
+       jsonb_build_object('sub', u.id::text, 'email', u.email, 'email_verified', true),
+       'email', now(), now(), now()
+from auth.users u
+where u.email in ('owner.a@dev.local','owner.b@dev.local','packer.a@dev.local','admin@dev.local')
+on conflict (provider, provider_id) do nothing;
+
+-- --------------------------------------------------------------------------
+-- The platform operator. Has no profile and belongs to no business: an
+-- operator administers the platform, they are not a super-user of any tenant.
+-- --------------------------------------------------------------------------
+
+insert into app.platform_admins (user_id, label)
+values ('99999999-9999-9999-9999-999999999999', 'dev operator')
+on conflict (user_id) do nothing;
 
 -- --------------------------------------------------------------------------
 -- Business A, seeded through the real API surface so the seed exercises the
