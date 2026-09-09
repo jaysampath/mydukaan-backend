@@ -10,7 +10,6 @@
     "db:link:dev": "supabase link --project-ref upwwipwgfzqswjcmqrha",
     "db:link:prod": "supabase link --project-ref fwlnsatdqrtyvvnagbqn",
     "db:push": "supabase db push",
-    "gen:app-schema": "node --env-file=.env.dev scripts/gen-app-schema.mjs",
     "test:sync": "node --env-file=.env.dev scripts/sync-contract-test.mjs",
     "test:admin": "node --env-file=.env.dev scripts/admin-contract-test.mjs",
     "verify": "npm run test:sync && npm run test:admin"

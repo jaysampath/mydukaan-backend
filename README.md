@@ -5,8 +5,11 @@ clients:
 
 | Repo | Talks to |
 |---|---|
-| `mydukaan` | the mobile app — `sync_pull` + the tenant RPCs |
+| `mydukaan-mobile` | the Expo app — `sync_pull` + the tenant RPCs |
 | `mydukaan-admin` | the operator portal — the `admin_*` RPCs |
+
+All three sit side by side under a `mydukaan/` parent folder; each is its own
+git repository.
 
 There is **no server here**. The API is a set of Postgres functions in the
 exposed `public` schema; the tables live in `app`, which PostgREST does not
@@ -26,7 +29,11 @@ The cost is that `src/db/schema.ts` in the app repo must mirror these
 migrations, and that mirroring is no longer one atomic commit. Two things guard
 it:
 
-1. **`scripts/gen-app-schema.mjs`** generates that file. It is not hand-written.
+1. **`describe_sync_schema()`** declares the local schema the server expects.
+   The app repo diffs its own `src/db/schema.ts` against it in
+   `src/db/schema.contract.test.ts`, which fails on any drift. The schema stays
+   hand-written — generating it would throw away the index choices and comments
+   that carry real judgment — but it can no longer drift silently.
 2. **`app.schema_contract()`** returns `{current, min_client}`. The app compares
    its baked-in version on every sync and refuses to sync — with an update
    prompt — if the server requires a newer client. Additive changes bump
@@ -50,8 +57,8 @@ read-only on purpose.
 After any schema change:
 
 ```bash
-npm run gen:app-schema -- --out ../mydukaan/src/db/schema.ts
-npm run verify
+npm run verify                      # both HTTP contract suites
+cd ../mydukaan-mobile && npm test    # the schema drift check
 # plus supabase/tests/*.sql against dev
 ```
 
@@ -66,7 +73,6 @@ supabase/
   seed/         dev fixtures (dev project only, guarded)
   functions/    Edge Functions — empty until Phase 7's RevenueCat webhook
 scripts/
-  gen-app-schema.mjs       emits the app repo's src/db/schema.ts
   sync-contract-test.mjs   exercises the tenant API over real HTTP
   admin-contract-test.mjs  exercises the admin API, both allowed and refused
 docs/
