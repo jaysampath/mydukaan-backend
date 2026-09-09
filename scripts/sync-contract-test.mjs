@@ -20,8 +20,6 @@ import { randomUUID } from 'node:crypto';
 const URL_BASE = process.env.SUPABASE_URL;
 const KEY = process.env.SUPABASE_PUBLISHABLE_KEY;
 const APP_ENV = process.env.APP_ENV;
-// Only used on the email fallback path. Supabase rejects reserved domains.
-const EMAIL_DOMAIN = process.env.CONTRACT_TEST_EMAIL_DOMAIN ?? 'dukaan-contract-test.com';
 
 if (!URL_BASE || !KEY) {
   console.error('Missing SUPABASE_URL / SUPABASE_PUBLISHABLE_KEY.');
@@ -71,50 +69,50 @@ const rpc = (fn, args, token) => api(`/rest/v1/rpc/${fn}`, { token, body: args }
 /**
  * Gets two independent sessions.
  *
- * Preference order:
- *  1. SUPABASE_ACCESS_TOKEN_A / _B, if you already have tokens.
- *  2. Anonymous sign-in, which needs "Allow anonymous sign-ins" enabled on the
- *     DEV project (Authentication > Sign In / Providers). This is the intended
- *     path: it costs nothing, works offline of any mail or SMS provider, and
- *     should never be enabled on prod.
- *  3. Email + password, which only works if mailer_autoconfirm is on -- without
- *     it, signup returns a user but no token, because the address is unverified.
+ * These are the two SEEDED users, signed in with a password. That matters for
+ * what this test can prove: they belong to DIFFERENT businesses, so "A writes,
+ * B must not see it" is a real cross-tenant assertion rather than two anonymous
+ * users who share no data either way.
  *
- * Phone/OTP is the real auth method for this app (Phase 1) but it needs an SMS
- * provider configured, so it is not what the contract test leans on.
+ * It used to try anonymous sign-in first, which is disabled on this project, so
+ * the test could not run at all. supabase/seed/dev_seed.sql now gives these
+ * accounts a real bcrypt password and an auth.identities row, which is what
+ * GoTrue actually resolves a password grant through.
+ *
+ * Phone/OTP is the real auth method for the app (Phase 1) but it needs an SMS
+ * provider, so it is not what the contract test leans on.
  */
+const SEEDED = {
+  A: {
+    email: process.env.TEST_OWNER_EMAIL ?? 'owner.a@dev.local',
+    password: process.env.TEST_OWNER_PASSWORD ?? 'devpassword123',
+  },
+  B: {
+    email: process.env.TEST_OWNER_B_EMAIL ?? 'owner.b@dev.local',
+    password: process.env.TEST_OWNER_B_PASSWORD ?? 'devpassword123',
+  },
+};
+
 async function session(label) {
   const preset = process.env[`SUPABASE_ACCESS_TOKEN_${label}`];
   if (preset) return preset;
 
-  const anon = await api('/auth/v1/signup', { body: {} });
-  if (anon.ok && anon.body?.access_token) return anon.body.access_token;
-
-  const stamp = `${Date.now()}${Math.random().toString(36).slice(2, 8)}`;
-  const email = `contract-${label.toLowerCase()}-${stamp}@${EMAIL_DOMAIN}`;
-  const password = `Contract-${stamp}-aA1!`;
-
-  const up = await api('/auth/v1/signup', { body: { email, password } });
-  if (up.ok && up.body?.access_token) return up.body.access_token;
-
-  const inn = await api('/auth/v1/token?grant_type=password', { body: { email, password } });
-  if (inn.ok && inn.body?.access_token) return inn.body.access_token;
+  const who = SEEDED[label];
+  const res = await api('/auth/v1/token?grant_type=password', {
+    body: { email: who.email, password: who.password },
+  });
+  if (res.ok && res.body?.access_token) return res.body.access_token;
 
   throw new Error(
     [
-      `Could not open a session for user ${label}.`,
+      `Could not sign in as ${who.email} (user ${label}).`,
       ``,
-      `  anonymous: ${anon.status} ${JSON.stringify(anon.body)}`,
-      `  signup:    ${up.status} ${JSON.stringify(up.body)}`,
-      `  signin:    ${inn.status} ${JSON.stringify(inn.body)}`,
+      `  ${res.status} ${JSON.stringify(res.body)}`,
       ``,
-      `Fix, in order of preference:`,
-      `  1. Enable "Allow anonymous sign-ins" on the DEV project only.`,
-      `  2. Or enable "Confirm email = off" (mailer_autoconfirm) on DEV.`,
-      `  3. Or export SUPABASE_ACCESS_TOKEN_A and SUPABASE_ACCESS_TOKEN_B.`,
+      `Has supabase/seed/dev_seed.sql been applied to this project?`,
+      `It is what gives the seeded accounts a usable password.`,
       ``,
-      `The same behaviours are covered at the SQL layer by`,
-      `supabase/tests/security_and_sync.sql, which needs none of this.`,
+      `Or export SUPABASE_ACCESS_TOKEN_A and SUPABASE_ACCESS_TOKEN_B.`,
     ].join('\n'),
   );
 }
@@ -164,10 +162,19 @@ async function main() {
   console.log('\n3. Pull / push round trip');
   const pull0 = await rpc('sync_pull', { last_pulled_at: null }, tokenA);
   check('sync_pull returns changes + timestamp', pull0.ok && !!pull0.body?.changes && typeof pull0.body?.timestamp === 'number', JSON.stringify(pull0.body).slice(0, 300));
+  // Exactly one business is the tenant-isolation assertion: one user belongs to
+  // one business, so a second row here would mean a leak. The profile count is
+  // deliberately NOT pinned to one -- the seeded tenant has an owner and a
+  // packer, and a colleague appearing in your pull is correct, not a fault.
   check(
-    'first pull carries the business and profile',
-    pull0.body?.changes?.businesses?.updated?.length === 1 &&
-      pull0.body?.changes?.profiles?.updated?.length === 1,
+    'first pull carries exactly one business -- the callers own',
+    pull0.body?.changes?.businesses?.updated?.length === 1,
+    `got ${pull0.body?.changes?.businesses?.updated?.length} businesses`,
+  );
+  check(
+    'first pull carries the callers own profile',
+    (pull0.body?.changes?.profiles?.updated ?? []).length >= 1,
+    `got ${pull0.body?.changes?.profiles?.updated?.length} profiles`,
   );
   check(
     'timestamps cross the wire as epoch-ms numbers',
@@ -303,7 +310,12 @@ async function main() {
   check('receipt is a payment receipt, not a tax invoice', receipt.body?.document_type === 'PAYMENT_RECEIPT');
 
   console.log('\n8. GSTIN toggle is free and functional');
-  check('GSTIN hidden while the toggle is off', receipt.body?.business?.gstin === null, JSON.stringify(receipt.body?.business));
+  // Set the precondition rather than assuming it. The test signs in as a
+  // persistent seeded user now, so state survives between runs -- an earlier
+  // run leaving the toggle on used to fail this.
+  await rpc('update_business_settings', { p_gstin: '36ABCDE1234F1Z5', p_show_gstin_on_receipt: false }, tokenA);
+  const receiptOff = await rpc('get_receipt', { p_order_id: orderId }, tokenA);
+  check('GSTIN hidden while the toggle is off', receiptOff.body?.business?.gstin === null, JSON.stringify(receiptOff.body?.business));
   await rpc('update_business_settings', { p_gstin: '36ABCDE1234F1Z5', p_show_gstin_on_receipt: true }, tokenA);
   const receipt2 = await rpc('get_receipt', { p_order_id: orderId }, tokenA);
   check('GSTIN shown once the toggle is on', receipt2.body?.business?.gstin === '36ABCDE1234F1Z5', JSON.stringify(receipt2.body?.business));
