@@ -1,0 +1,74 @@
+# My Dukaan — backend
+
+The database, the API, and the tests that keep them honest. Consumed by two
+clients:
+
+| Repo | Talks to |
+|---|---|
+| `mydukaan` | the mobile app — `sync_pull` + the tenant RPCs |
+| `mydukaan-admin` | the operator portal — the `admin_*` RPCs |
+
+There is **no server here**. The API is a set of Postgres functions in the
+exposed `public` schema; the tables live in `app`, which PostgREST does not
+expose. See [docs/supabase-access.md](docs/supabase-access.md) — read it before
+changing anything.
+
+---
+
+## Why this is a separate repo
+
+Backend changes ship without an App Store review. That was already true when
+this lived in the app repo (nothing under `supabase/` is bundled — Metro only
+bundles what `index.ts` imports), but keeping it separate makes the boundary
+explicit and lets the schema be reviewed without the app.
+
+The cost is that `src/db/schema.ts` in the app repo must mirror these
+migrations, and that mirroring is no longer one atomic commit. Two things guard
+it:
+
+1. **`scripts/gen-app-schema.mjs`** generates that file. It is not hand-written.
+2. **`app.schema_contract()`** returns `{current, min_client}`. The app compares
+   its baked-in version on every sync and refuses to sync — with an update
+   prompt — if the server requires a newer client. Additive changes bump
+   `current` only, so they never brick an old install; only a breaking change
+   bumps `min_client`.
+
+---
+
+## Deploying
+
+```bash
+npm run db:link:dev && npm run db:push     # dev
+npm run db:link:prod && npm run db:push    # prod
+```
+
+Migrations are applied in filename order and are **append-only once applied** —
+fix a defect with a new migration, never by editing one that has run. Dev is
+also reachable through the Supabase MCP server; prod's MCP connection is
+read-only on purpose.
+
+After any schema change:
+
+```bash
+npm run gen:app-schema -- --out ../mydukaan/src/db/schema.ts
+npm run verify
+# plus supabase/tests/*.sql against dev
+```
+
+---
+
+## Layout
+
+```
+supabase/
+  migrations/   append-only once applied
+  tests/        the checks a schema change must pass
+  seed/         dev fixtures (dev project only, guarded)
+  functions/    Edge Functions — empty until Phase 7's RevenueCat webhook
+scripts/
+  gen-app-schema.mjs       emits the app repo's src/db/schema.ts
+  sync-contract-test.mjs   exercises the tenant API over real HTTP
+  admin-contract-test.mjs  exercises the admin API, both allowed and refused
+docs/
+  supabase-access.md       the security model
+```
