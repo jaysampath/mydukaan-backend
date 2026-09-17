@@ -110,8 +110,57 @@ secdef_owner as (
   join pg_roles o on o.oid=p.proowner
   where n.nspname='public' and p.prosecdef and o.rolbypassrls
     and p.prokind='f'
+    -- The sanctioned exceptions. Each one necessarily runs before the caller
+    -- has a profile for RLS to match on, or is deliberately cross-tenant.
+    -- Kept in step with the same allowlist in admin_security.sql; a function
+    -- added here without being added there (or vice versa) is a review smell.
     and p.proname <> 'bootstrap_business'   -- sanctioned, see 0007
+    and p.proname <> 'claim_invite'         -- sanctioned, see 0014
+    and p.proname not like 'admin\_%'       -- sanctioned, see 0013/0015
     and p.proname <> 'rls_auto_enable'      -- Supabase platform event trigger
+),
+-- ---------------------------------------------------------------------------
+-- The read layer's guard rails (added with 0017).
+--
+-- The tenant analogue of admin_security.sql's admin_fn_without_guard. There are
+-- now seventeen read functions in public, each of which is one forgotten
+-- `perform app.require_member()` away from serving another shop's books. Nothing
+-- in SQL compiles that boundary, so it is asserted mechanically instead: a new
+-- list_/get_ function that omits the guard, or that never mentions
+-- current_business_id, fails this suite rather than shipping.
+--
+-- get_my_context is the one deliberate exemption: it is callable before a
+-- membership exists, because it is what the app uses to discover that it has
+-- none. See 0017.
+-- ---------------------------------------------------------------------------
+read_fn_without_guard as (
+  select 'tenant_read_function_missing_guard',
+         p.proname||'('||pg_get_function_identity_arguments(p.oid)||')'
+  from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+  where n.nspname='public' and p.prokind='f'
+    and (p.proname like 'list\_%' or p.proname like 'get\_%')
+    and p.proname not like 'admin\_%'
+    and p.proname <> 'get_my_context'
+    and pg_get_functiondef(p.oid) !~ 'require_member|require_role|require_platform_admin'
+),
+read_fn_without_tenant_scope as (
+  select 'tenant_read_function_missing_business_scope',
+         p.proname||'('||pg_get_function_identity_arguments(p.oid)||')'
+  from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+  where n.nspname='public' and p.prokind='f'
+    and (p.proname like 'list\_%' or p.proname like 'get\_%')
+    and p.proname not like 'admin\_%'
+    and pg_get_functiondef(p.oid) !~ 'current_business_id'
+),
+-- A read marked VOLATILE cannot be inlined or cached by the planner, and on a
+-- 2G connection every avoidable re-plan is felt. Cheap to assert, easy to forget.
+read_fn_not_stable as (
+  select 'read_function_not_stable',
+         p.proname||' volatility='||p.provolatile::text
+  from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+  where n.nspname='public' and p.prokind='f'
+    and (p.proname like 'list\_%' or p.proname like 'get\_%')
+    and p.provolatile = 'v'
 )
 select * from rls_missing
 union all select * from rls_not_forced
@@ -121,6 +170,9 @@ union all select * from secdef_view
 union all select * from table_in_exposed_schema
 union all select * from client_reachable
 union all select * from secdef_owner
+union all select * from read_fn_without_guard
+union all select * from read_fn_without_tenant_scope
+union all select * from read_fn_not_stable
 order by 1,2;
 
 \echo '== 3. Behavioural checks =================================================='
