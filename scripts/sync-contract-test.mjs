@@ -379,6 +379,7 @@ async function main() {
     ['get_stock_snapshot', {}], ['get_day_summary', {}],
     ['get_order', { p_order_id: orderId }],
     ['get_customer_ledger', { p_customer_id: custId }],
+    ['list_due_orders', {}],
   ];
   let readsOk = true;
   const readFailures = [];
@@ -460,6 +461,10 @@ async function main() {
     ['upsert_raw_material', { p_id: randomUUID(), p_name: 'Nope' }],
     ['invite_member', { p_invite_id: randomUUID(), p_role: 'OWNER', p_phone: '9000000000' }],
     ['record_stock_adjustment', { p_entry_id: randomUUID(), p_item_kind: 'RAW', p_item_id: rawId, p_mode: 'SET', p_qty: 1 }],
+    ['list_due_orders', {}],
+    ['set_order_due_date', { p_order_id: orderId, p_due_on: null }],
+    ['set_customer_credit_days', { p_customer_id: custId, p_credit_days: 30 }],
+    ['set_default_credit_days', { p_credit_days: 30 }],
   ];
   const wronglyRefused = [];
   for (const [fn, args] of PACKER_ALLOWED) {
@@ -738,6 +743,294 @@ async function main() {
       wrong.status >= 400 && wrong.body?.code === '22023', JSON.stringify(wrong.body));
   }
 
+  // =========================================================================
+  // 14. Credit terms and due dates (migration 0022).
+  //
+  // due_on is stamped from the customer's terms (else the shop's) when the
+  // goods have gone; overdue is derived from the order's balance, so settling
+  // an order clears it. "Today" is the Indian calendar date.
+  // =========================================================================
+  console.log('\n14. Credit terms and due dates');
+  const dueCust = randomUUID();
+  const plainCust = randomUUID();
+  const defaultCust = randomUUID();
+  // Shared with section 15.
+  let dueX = null;
+  let dueY = null;
+  let yPaymentId = null;
+  {
+    const istDay = (offsetDays = 0) => {
+      const d = new Date(Date.now() + 5.5 * 3600 * 1000);
+      d.setUTCDate(d.getUTCDate() + offsetDays);
+      return d.toISOString().slice(0, 10);
+    };
+    await rpc('record_stock_adjustment',
+      { p_entry_id: randomUUID(), p_item_kind: 'PACKED', p_item_id: skuId,
+        p_mode: 'DELTA', p_qty: 20, p_note: 'due-date test stock' }, tokenA);
+    const mk = async (customer) => {
+      const id = randomUUID();
+      await rpc('create_order',
+        { p_order_id: id, p_customer_id: customer, p_items: [{ packed_sku_id: skuId, qty_packets: 1 }] }, tokenA);
+      await rpc('dispatch_order', { p_order_id: id }, tokenA);
+      return id;
+    };
+    const getOrder = async (id, token = tokenA) => (await rpc('get_order', { p_order_id: id }, token)).body;
+    const dueList = async (scope) =>
+      (await rpc('list_due_orders', { p_scope: scope, p_limit: 200 }, tokenA)).body;
+
+    await rpc('upsert_customer', { p_id: dueCust, p_name: `Due Test ${Date.now()}` }, tokenA);
+    const terms = await rpc('set_customer_credit_days', { p_customer_id: dueCust, p_credit_days: 30 }, tokenA);
+    check('an owner can give a customer 30 days credit',
+      terms.ok && terms.body?.credit_days === 30, JSON.stringify(terms.body));
+
+    const badTerms = await rpc('set_customer_credit_days', { p_customer_id: dueCust, p_credit_days: 400 }, tokenA);
+    check('credit days outside 0..365 are refused', badTerms.body?.code === '22023', JSON.stringify(badTerms.body));
+
+    dueX = await mk(dueCust);
+    await rpc('set_order_status', { p_order_id: dueX, p_status: 'DELIVERED' }, tokenA);
+    let x = await getOrder(dueX);
+    check('delivery stamps due_on = delivery date + the customer\'s terms',
+      x?.order?.due_on === istDay(30), `${x?.order?.due_on} vs ${istDay(30)}`);
+    check('a future due date reads UPCOMING, with days to go',
+      x?.due_state === 'UPCOMING' && x?.due_in_days === 30, JSON.stringify([x?.due_state, x?.due_in_days]));
+    check('a delivered unpaid order offers set_due_date',
+      (x?.allowed_transitions ?? []).includes('set_due_date'), JSON.stringify(x?.allowed_transitions));
+
+    // The door path: cash at the door moves OUT_FOR_DELIVERY -> PAYMENT_PENDING
+    // without ever setting delivered_at. The trigger still has to date it.
+    dueY = await mk(dueCust);
+    yPaymentId = randomUUID();
+    await rpc('record_payment',
+      { p_payment_id: yPaymentId, p_customer_id: dueCust, p_amount: 10, p_order_id: dueY }, tokenA);
+    const y = await getOrder(dueY);
+    check('a part payment at the door also stamps the due date',
+      y?.order?.status === 'PAYMENT_PENDING' && y?.order?.due_on === istDay(30),
+      JSON.stringify(y?.order));
+
+    const moved = await rpc('set_order_due_date', { p_order_id: dueX, p_due_on: istDay(-3) }, tokenA);
+    x = await getOrder(dueX);
+    check('the owner can move one order\'s due date',
+      moved.ok && x?.order?.due_on === istDay(-3), JSON.stringify(moved.body));
+    check('a passed due date reads OVERDUE, with negative days',
+      x?.due_state === 'OVERDUE' && x?.due_in_days === -3, JSON.stringify([x?.due_state, x?.due_in_days]));
+
+    await rpc('set_order_due_date', { p_order_id: dueY, p_due_on: istDay(0) }, tokenA);
+    check('a due date of today reads DUE_TODAY', (await getOrder(dueY))?.due_state === 'DUE_TODAY');
+
+    const overdue = await dueList('OVERDUE');
+    const today = await dueList('DUE_TODAY');
+    check('list_due_orders scopes overdue and due-today orders',
+      overdue?.rows?.some((r) => r.id === dueX) && !overdue?.rows?.some((r) => r.id === dueY)
+        && today?.rows?.some((r) => r.id === dueY),
+      JSON.stringify({ overdue: overdue?.rows?.length, today: today?.rows?.length }));
+    check('list_due_orders carries a summary for the chips',
+      overdue?.summary?.overdue?.count >= 1 && overdue?.summary?.due_today?.count >= 1,
+      JSON.stringify(overdue?.summary));
+    const unknownScope = await rpc('list_due_orders', { p_scope: 'LATE' }, tokenA);
+    check('an unknown scope is refused', unknownScope.body?.code === '22023', JSON.stringify(unknownScope.body));
+
+    const day = (await rpc('get_day_summary', {}, tokenA)).body;
+    check('the home summary counts overdue and due-today',
+      day?.overdue_count >= 1 && Number(day?.overdue_amount) > 0 && day?.due_today_count >= 1,
+      JSON.stringify(day));
+
+    const bal = (await rpc('list_customer_balances', { p_search: 'Due Test', p_limit: 200 }, tokenA)).body;
+    const xBalance = Number(x?.balance);
+    check('the khata list shows each customer\'s overdue amount',
+      Number(bal?.rows?.find((r) => r.customer_id === dueCust)?.overdue_amount) === xBalance,
+      JSON.stringify(bal?.rows?.find((r) => r.customer_id === dueCust)));
+
+    const bSees = await rpc('list_due_orders', { p_limit: 200 }, tokenB);
+    check('B never sees A\'s due orders',
+      bSees.ok && !bSees.body?.rows?.some((r) => r.id === dueX || r.id === dueY), `${bSees.status}`);
+    const bMoves = await rpc('set_order_due_date', { p_order_id: dueX, p_due_on: istDay(90) }, tokenB);
+    check('B cannot move A\'s due date', !bMoves.ok && (await getOrder(dueX))?.order?.due_on === istDay(-3),
+      JSON.stringify(bMoves.body));
+
+    // Overdue is derived: account cash settles the oldest order (X) first,
+    // and X stops being overdue without anyone touching its date.
+    await rpc('record_payment',
+      { p_payment_id: randomUUID(), p_customer_id: dueCust, p_amount: xBalance }, tokenA);
+    x = await getOrder(dueX);
+    check('settling an overdue order clears its overdue state',
+      x?.order?.status === 'CLOSED' && x?.due_state === null && x?.order?.due_on === istDay(-3),
+      JSON.stringify({ status: x?.order?.status, state: x?.due_state }));
+    check('...and it leaves the Due list', !(await dueList('OVERDUE'))?.rows?.some((r) => r.id === dueX));
+
+    const closedMove = await rpc('set_order_due_date', { p_order_id: dueX, p_due_on: istDay(5) }, tokenA);
+    check('a closed order has no due date to move',
+      closedMove.body?.code === '22023' && closedMove.body?.hint === 'not_due', JSON.stringify(closedMove.body));
+
+    await rpc('set_order_due_date', { p_order_id: dueY, p_due_on: null }, tokenA);
+    const yCleared = await getOrder(dueY);
+    check('clearing a due date takes the order off the Due list',
+      yCleared?.order?.due_on === null && yCleared?.due_state === null
+        && !(await dueList(null))?.rows?.some((r) => r.id === dueY),
+      JSON.stringify(yCleared?.order));
+
+    // No terms, no date -- then terms arrive and the open debt is dated.
+    await rpc('upsert_customer', { p_id: plainCust, p_name: `No Terms ${Date.now()}` }, tokenA);
+    const z = await mk(plainCust);
+    await rpc('set_order_status', { p_order_id: z, p_status: 'DELIVERED' }, tokenA);
+    check('with no terms anywhere, delivery sets no due date',
+      (await getOrder(z))?.order?.due_on === null);
+    const late = await rpc('set_customer_credit_days', { p_customer_id: plainCust, p_credit_days: 15 }, tokenA);
+    check('setting terms later dates the customer\'s open orders',
+      late.body?.orders_dated === 1 && (await getOrder(z))?.order?.due_on === istDay(15),
+      JSON.stringify(late.body));
+
+    // The shop default, for customers with no terms of their own.
+    const before = (await rpc('get_my_context', {}, tokenA)).body?.business?.default_credit_days ?? null;
+    await rpc('upsert_customer', { p_id: defaultCust, p_name: `Default Terms ${Date.now()}` }, tokenA);
+    const setDefault = await rpc('set_default_credit_days', { p_credit_days: 7 }, tokenA);
+    const ctxAfter = (await rpc('get_my_context', {}, tokenA)).body;
+    check('the owner can set a shop-wide default',
+      setDefault.ok && ctxAfter?.business?.default_credit_days === 7, JSON.stringify(setDefault.body));
+    const w = await mk(defaultCust);
+    await rpc('set_order_status', { p_order_id: w, p_status: 'DELIVERED' }, tokenA);
+    check('a customer without terms gets the shop default',
+      (await getOrder(w))?.order?.due_on === istDay(7));
+    check('...while a customer with terms keeps theirs',
+      (await getOrder(z))?.order?.due_on === istDay(15));
+    await rpc('set_default_credit_days', { p_credit_days: before }, tokenA);
+  }
+
+  // =========================================================================
+  // 15. Voucher photo RPCs (migration 0023). OWNER only, for everything.
+  //
+  // These are the database half. The bytes go through the Worker in
+  // mydukaan-cloudflare, which has its own HTTP test.
+  // =========================================================================
+  console.log('\n15. Voucher photo RPCs');
+  {
+    const photo = randomUUID();
+    const auth = await rpc('authorize_voucher_upload', { p_photo_id: photo, p_order_id: dueY }, tokenA);
+    check('authorize_voucher_upload returns a key scoped to the order',
+      auth.ok && auth.body?.object_key === `v1/${dueY}/${photo}.jpg` && auth.body?.already_uploaded === false,
+      JSON.stringify(auth.body));
+
+    const attach = (args, token = tokenA) => rpc('attach_voucher_photo',
+      { p_photo_id: photo, p_order_id: dueY, p_payment_id: yPaymentId, p_size_bytes: 1234,
+        p_width: 1200, p_height: 1600, ...args }, token);
+    const first = await attach({});
+    const again = await attach({});
+    check('attach_voucher_photo is idempotent on the photo id',
+      first.body?.created === true && again.body?.created === false,
+      JSON.stringify([first.body, again.body]));
+    const reauth = await rpc('authorize_voucher_upload', { p_photo_id: photo, p_order_id: dueY }, tokenA);
+    check('a retried upload is told the photo is already there',
+      reauth.body?.already_uploaded === true, JSON.stringify(reauth.body));
+
+    const y = (await rpc('get_order', { p_order_id: dueY }, tokenA)).body;
+    check('get_order lists the voucher for the owner, with its payment',
+      y?.vouchers?.length === 1 && y.vouchers[0].id === photo && Number(y.vouchers[0].payment_amount) === 10,
+      JSON.stringify(y?.vouchers));
+    const ledger = (await rpc('get_customer_ledger', { p_customer_id: dueCust }, tokenA)).body;
+    check('the khata counts vouchers per payment',
+      ledger?.payments?.rows?.find((p) => p.id === yPaymentId)?.voucher_count === 1);
+    const view = await rpc('get_voucher_photo', { p_photo_id: photo }, tokenA);
+    check('get_voucher_photo answers the owner with the object key',
+      view.ok && view.body?.object_key === auth.body?.object_key, JSON.stringify(view.body));
+
+    const wrongPay = await rpc('attach_voucher_photo',
+      { p_photo_id: randomUUID(), p_order_id: dueX, p_payment_id: yPaymentId, p_size_bytes: 10 }, tokenA);
+    check('a payment from a different order is refused', wrongPay.body?.code === '22023', JSON.stringify(wrongPay.body));
+    const empty = await rpc('attach_voucher_photo',
+      { p_photo_id: randomUUID(), p_order_id: dueY, p_size_bytes: 0 }, tokenA);
+    check('an empty photo is refused', empty.body?.code === '22023', JSON.stringify(empty.body));
+
+    // Staff never see the feature: the packer is refused all four calls, with
+    // real ids, and its get_order shows no vouchers.
+    const packerCalls = [
+      ['authorize_voucher_upload', { p_photo_id: randomUUID(), p_order_id: dueY }],
+      ['attach_voucher_photo', { p_photo_id: randomUUID(), p_order_id: dueY, p_size_bytes: 10 }],
+      ['get_voucher_photo', { p_photo_id: photo }],
+      ['hide_voucher_photo', { p_photo_id: photo }],
+    ];
+    const packerGot = [];
+    for (const [fn, args] of packerCalls) {
+      const r = await rpc(fn, args, tokenP);
+      if (r.body?.code !== '42501') packerGot.push(`${fn} -> ${r.status} ${r.body?.code}`);
+    }
+    check('a packer is refused every voucher call', packerGot.length === 0, packerGot.join(', '));
+    const packerOrder = (await rpc('get_order', { p_order_id: dueY }, tokenP)).body;
+    check('...and sees no vouchers on the order', Array.isArray(packerOrder?.vouchers) && packerOrder.vouchers.length === 0,
+      JSON.stringify(packerOrder?.vouchers));
+
+    const bAuth = await rpc('authorize_voucher_upload', { p_photo_id: randomUUID(), p_order_id: dueY }, tokenB);
+    const bView = await rpc('get_voucher_photo', { p_photo_id: photo }, tokenB);
+    check('B can neither upload to nor view A\'s vouchers',
+      bAuth.body?.code === 'P0002' && bView.body?.code === 'P0002',
+      JSON.stringify([bAuth.body?.code, bView.body?.code]));
+
+    const hide = await rpc('hide_voucher_photo', { p_photo_id: photo }, tokenA);
+    const hideAgain = await rpc('hide_voucher_photo', { p_photo_id: photo }, tokenA);
+    const hiddenView = await rpc('get_voucher_photo', { p_photo_id: photo }, tokenA);
+    const hiddenOrder = (await rpc('get_order', { p_order_id: dueY }, tokenA)).body;
+    check('a hidden voucher is gone from the order and cannot be fetched',
+      hide.ok && hideAgain.ok && hiddenView.body?.code === 'P0002' && hiddenOrder?.vouchers?.length === 0,
+      JSON.stringify({ hide: hide.body, view: hiddenView.body?.code }));
+
+    const cancelledId = randomUUID();
+    await rpc('create_order',
+      { p_order_id: cancelledId, p_customer_id: dueCust, p_items: [{ packed_sku_id: skuId, qty_packets: 1 }] }, tokenA);
+    await rpc('set_order_status', { p_order_id: cancelledId, p_status: 'CANCELLED' }, tokenA);
+    const onCancelled = await rpc('authorize_voucher_upload',
+      { p_photo_id: randomUUID(), p_order_id: cancelledId }, tokenA);
+    check('a cancelled order takes no vouchers', onCancelled.body?.code === '22023', JSON.stringify(onCancelled.body));
+  }
+
+  // =========================================================================
+  // 16. How a payment was made: CASH or UPI (migration 0024).
+  //
+  // The app only records what the owner says; nothing is verified. Old builds
+  // send no p_method and must keep recording cash.
+  // =========================================================================
+  console.log('\n16. Payment method');
+  {
+    const today = (await rpc('get_day_summary', {}, tokenA)).body;
+    const upiBefore = Number(today?.collected_upi ?? 0);
+    const totalBefore = Number(today?.cash_collected ?? 0);
+
+    const upiId = randomUUID();
+    const upi = await rpc('record_payment',
+      { p_payment_id: upiId, p_customer_id: dueCust, p_amount: 25, p_order_id: dueY, p_method: 'UPI' }, tokenA);
+    check('a payment can be recorded as UPI', upi.ok && upi.body?.method === 'UPI', JSON.stringify(upi.body));
+
+    const legacyId = randomUUID();
+    const legacy = await rpc('record_payment',
+      { p_payment_id: legacyId, p_customer_id: dueCust, p_amount: 5 }, tokenA);
+    check('a call without p_method (an old build) still records CASH',
+      legacy.ok && legacy.body?.method === 'CASH', JSON.stringify(legacy.body));
+
+    const lower = await rpc('record_payment',
+      { p_payment_id: randomUUID(), p_customer_id: dueCust, p_amount: 1, p_method: ' upi ' }, tokenA);
+    check('the method is normalised', lower.body?.method === 'UPI', JSON.stringify(lower.body));
+
+    const card = await rpc('record_payment',
+      { p_payment_id: randomUUID(), p_customer_id: dueCust, p_amount: 1, p_method: 'CARD' }, tokenA);
+    check('anything but CASH or UPI is refused', card.body?.code === '22023', JSON.stringify(card.body));
+
+    const listed = (await rpc('list_payments', { p_customer_id: dueCust, p_limit: 200 }, tokenA)).body;
+    const byId = new Map((listed?.rows ?? []).map((p) => [p.id, p.method]));
+    check('list_payments reports each method',
+      byId.get(upiId) === 'UPI' && byId.get(legacyId) === 'CASH', JSON.stringify([...byId.entries()].slice(0, 5)));
+
+    const order = (await rpc('get_order', { p_order_id: dueY }, tokenA)).body;
+    check('get_order reports the method of each payment',
+      order?.payments?.find((p) => p.id === upiId)?.method === 'UPI', JSON.stringify(order?.payments));
+    const ledger = (await rpc('get_customer_ledger', { p_customer_id: dueCust }, tokenA)).body;
+    check('the khata reports the method of each payment',
+      ledger?.payments?.rows?.find((p) => p.id === upiId)?.method === 'UPI');
+
+    const after = (await rpc('get_day_summary', {}, tokenA)).body;
+    check('the home summary splits the day by method, and the total still counts both',
+      Number(after?.collected_upi) === upiBefore + 26
+        && Number(after?.cash_collected) === totalBefore + 31
+        && Number(after?.collected_cash) + Number(after?.collected_upi) === Number(after?.cash_collected),
+      JSON.stringify({ upiBefore, totalBefore, after }));
+  }
+
   console.log('\n13. Cleanup');
   {
     const archived = [];
@@ -747,6 +1040,9 @@ async function main() {
       ['raw_materials', rawId],
       ['customers', custId],
       ['customers', allocCust],
+      ['customers', dueCust],
+      ['customers', plainCust],
+      ['customers', defaultCust],
     ]) {
       const res = await rpc('archive_master', { p_table: table, p_id: id }, tokenA);
       if (res.ok && res.body?.archived) archived.push(table);

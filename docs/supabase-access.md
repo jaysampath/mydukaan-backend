@@ -143,7 +143,7 @@ without doing this.
 | `create_order(id, customer, items)` | OWNER, MANAGER | Prices from the SKU unless overridden. |
 | `dispatch_order(id)` | OWNER, MANAGER, DELIVERY | **Stock leaves here**, not at order confirmation. |
 | `set_order_status(id, status)` | any member | Cannot reach `OUT_FOR_DELIVERY` or `CLOSED`. |
-| `record_payment(...)` | OWNER, MANAGER, DELIVERY | Appends. With `p_order_id` the cash is for that order (which must be this customer's); without it, it is account credit that settles the customer's oldest orders first. Closes delivered orders that are now fully covered and returns `settled_orders`. Never closes a PLACED/PACKED order. See 0021. |
+| `record_payment(...)` | OWNER, MANAGER, DELIVERY | Appends. `p_method` is CASH or UPI (0024), defaulting to CASH so older builds record cash; it is recorded, never verified. With `p_order_id` the cash is for that order (which must be this customer's); without it, it is account credit that settles the customer's oldest orders first. Closes delivered orders that are now fully covered and returns `settled_orders`. Never closes a PLACED/PACKED order. See 0021. |
 | `get_receipt(id)` | any member | Server decides what is on the receipt. |
 | `get_stock_snapshot()` | any member | Derived from the ledger every call. |
 | `get_customer_ledger(id)` | any member | The running khata. |
@@ -154,6 +154,12 @@ without doing this.
 | `schema_contract()` / `describe_sync_schema()` | any / anon | 0009-0010. The client compatibility contract. |
 | `claim_invite(token, name)` | any authed user | 0014. Attaches a user to a business. Enforces `seat_limit`. |
 | `admin_*` (nine functions) | platform operator | 0015. Cross-tenant. See "The operator API" below. |
+| `set_customer_credit_days(id, days)` | OWNER, MANAGER | 0022. null clears (shop default applies). Dates the customer's open orders that had no due date; never moves one. |
+| `set_default_credit_days(days)` | OWNER | 0022. The shop's terms for customers without their own; same backfill. |
+| `set_order_due_date(id, due_on)` | OWNER, MANAGER | 0022. Per-order override; only OUT_FOR_DELIVERY / DELIVERED / PAYMENT_PENDING (hint `not_due`). |
+| `list_due_orders(scope)` | OWNER, MANAGER, DELIVERY | 0022. Live orders with a balance and a due date, soonest first, plus `summary` counts. Overdue is derived, against `app.local_today()` (IST). |
+| `authorize_voucher_upload` / `attach_voucher_photo` | OWNER | 0023. Called by the voucher Worker with the caller's JWT, around its R2 put. Idempotent on the photo id. |
+| `get_voucher_photo(id)` / `hide_voucher_photo(id)` | OWNER | 0023. The Worker's read check; hide is a soft delete. See ADR 0004 (mobile repo). |
 
 Every operation takes the record's UUID **from the caller**, so a phone that
 loses signal mid-call can retry safely. `dispatch_order` called twice deducts
