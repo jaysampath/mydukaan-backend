@@ -620,6 +620,124 @@ async function main() {
   // be; they are history, and a handful of them makes the dev tenant more
   // useful to test against rather than less.
   // =========================================================================
+  // =========================================================================
+  // 12b. Account payments settle orders, oldest first (migration 0021).
+  //
+  // Cash taken on the khata carries no order_id. Before 0021 it lowered the
+  // outstanding and counted against nothing, so an owner who was paid in full
+  // still saw every order "unpaid". Each order's paid/balance is now derived:
+  // account credit covers the oldest live orders first.
+  //
+  // A fresh customer, so the arithmetic below starts from zero.
+  // =========================================================================
+  console.log('\n12b. Account payments settle orders, oldest first');
+  const allocCust = randomUUID();
+  {
+    await rpc('upsert_customer', { p_id: allocCust, p_name: `Alloc Test ${Date.now()}` }, tokenA);
+    // Packets to sell. Section 6 left only a few.
+    await rpc('record_stock_adjustment',
+      { p_entry_id: randomUUID(), p_item_kind: 'PACKED', p_item_id: skuId,
+        p_mode: 'DELTA', p_qty: 20, p_note: 'allocation test stock' }, tokenA);
+
+    const mkOrder = async (packets) => {
+      const id = randomUUID();
+      const r = await rpc('create_order',
+        { p_order_id: id, p_customer_id: allocCust, p_items: [{ packed_sku_id: skuId, qty_packets: packets }] }, tokenA);
+      return { id, no: r.body?.order_no, total: Number(r.body?.total_amount) };
+    };
+    const deliver = async (id) => {
+      await rpc('dispatch_order', { p_order_id: id }, tokenA);
+      return rpc('set_order_status', { p_order_id: id, p_status: 'DELIVERED' }, tokenA);
+    };
+    const pay = (amount, orderId = null) => rpc('record_payment',
+      { p_payment_id: randomUUID(), p_customer_id: allocCust, p_amount: amount, p_order_id: orderId }, tokenA);
+    const orders = async () => {
+      const r = await rpc('list_orders', { p_customer_id: allocCust, p_limit: 200 }, tokenA);
+      return new Map((r.body?.rows ?? []).map((o) => [o.id, o]));
+    };
+    const outstanding = async () => {
+      const r = await rpc('get_customer_ledger', { p_customer_id: allocCust }, tokenA);
+      return Number(r.body?.balance?.outstanding);
+    };
+    // The invariant the whole design rests on.
+    const balancesMatchKhata = async (label) => {
+      const sum = [...(await orders()).values()].reduce((s, o) => s + Number(o.balance), 0);
+      const out = await outstanding();
+      check(`order balances add up to the khata (${label})`, sum === Math.max(out, 0), `Σ=${sum} khata=${out}`);
+    };
+
+    // A (₹120) is older than B (₹180). Both delivered, both unpaid.
+    const A = await mkOrder(2);
+    const B = await mkOrder(3);
+    await deliver(A.id);
+    await deliver(B.id);
+
+    const p1 = await pay(200);
+    let o = await orders();
+    check('an account payment closes the oldest order it covers',
+      o.get(A.id)?.status === 'CLOSED' && Number(o.get(A.id)?.balance) === 0,
+      JSON.stringify(o.get(A.id)));
+    check('the rest of it part-pays the next order, which stays DELIVERED',
+      o.get(B.id)?.status === 'DELIVERED' && Number(o.get(B.id)?.balance) === 100
+        && Number(o.get(B.id)?.paid_from_account) === 80,
+      JSON.stringify(o.get(B.id)));
+    check('record_payment reports which orders it settled',
+      JSON.stringify(p1.body?.settled_orders) === JSON.stringify([A.no]), JSON.stringify(p1.body));
+    await balancesMatchKhata('after a part payment');
+
+    const p2 = await pay(100);
+    o = await orders();
+    check('a second account payment settles the next order',
+      o.get(B.id)?.status === 'CLOSED' && JSON.stringify(p2.body?.settled_orders) === JSON.stringify([B.no]),
+      JSON.stringify({ b: o.get(B.id), p2: p2.body }));
+
+    // The bug 0021 fixed: paying up front used to CLOSE a PLACED order, so it
+    // skipped packing and dispatch entirely.
+    const C = await mkOrder(1);
+    await pay(60, C.id);
+    const cAfterPay = await rpc('get_order', { p_order_id: C.id }, tokenA);
+    check('a prepaid order stays PLACED -- money does not skip packing',
+      cAfterPay.body?.order?.status === 'PLACED' && Number(cAfterPay.body?.balance) === 0,
+      JSON.stringify(cAfterPay.body?.order));
+    check('a fully prepaid order does not offer record_payment',
+      !(cAfterPay.body?.allowed_transitions ?? []).includes('record_payment'),
+      JSON.stringify(cAfterPay.body?.allowed_transitions));
+    await rpc('set_order_status', { p_order_id: C.id, p_status: 'PACKED' }, tokenA);
+    const cDelivered = await deliver(C.id);
+    check('a prepaid order closes when it is delivered',
+      cDelivered.body?.status === 'CLOSED', JSON.stringify(cDelivered.body));
+
+    // Overpaying one order carries the excess to the next oldest.
+    const D = await mkOrder(1);
+    const E = await mkOrder(1);
+    await deliver(D.id);
+    await deliver(E.id);
+    await pay(100, D.id);
+    o = await orders();
+    check('overpayment on one order flows to the next oldest',
+      o.get(D.id)?.status === 'CLOSED' && Number(o.get(E.id)?.balance) === 20
+        && Number(o.get(E.id)?.paid_from_account) === 40,
+      JSON.stringify({ d: o.get(D.id), e: o.get(E.id) }));
+    await balancesMatchKhata('after an overpayment');
+
+    // Cancelling a prepaid order hands its money back to the account, where
+    // it settles E.
+    const F = await mkOrder(1);
+    await pay(60, F.id);
+    const cancelled = await rpc('set_order_status', { p_order_id: F.id, p_status: 'CANCELLED' }, tokenA);
+    o = await orders();
+    check('cancelling returns its payment to the account, settling an older order',
+      o.get(E.id)?.status === 'CLOSED'
+        && JSON.stringify(cancelled.body?.settled_orders) === JSON.stringify([E.no]),
+      JSON.stringify({ e: o.get(E.id), cancel: cancelled.body }));
+    check('the leftover is credit on the khata', (await outstanding()) === -40, String(await outstanding()));
+
+    const wrong = await rpc('record_payment',
+      { p_payment_id: randomUUID(), p_customer_id: allocCust, p_amount: 10, p_order_id: orderId }, tokenA);
+    check("a payment cannot be linked to another customer's order",
+      wrong.status >= 400 && wrong.body?.code === '22023', JSON.stringify(wrong.body));
+  }
+
   console.log('\n13. Cleanup');
   {
     const archived = [];
@@ -628,6 +746,7 @@ async function main() {
       ['packed_skus', skuId],
       ['raw_materials', rawId],
       ['customers', custId],
+      ['customers', allocCust],
     ]) {
       const res = await rpc('archive_master', { p_table: table, p_id: id }, tokenA);
       if (res.ok && res.body?.archived) archived.push(table);

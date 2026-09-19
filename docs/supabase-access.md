@@ -143,7 +143,7 @@ without doing this.
 | `create_order(id, customer, items)` | OWNER, MANAGER | Prices from the SKU unless overridden. |
 | `dispatch_order(id)` | OWNER, MANAGER, DELIVERY | **Stock leaves here**, not at order confirmation. |
 | `set_order_status(id, status)` | any member | Cannot reach `OUT_FOR_DELIVERY` or `CLOSED`. |
-| `record_payment(...)` | OWNER, MANAGER, DELIVERY | Appends; closes the order when fully paid. |
+| `record_payment(...)` | OWNER, MANAGER, DELIVERY | Appends. With `p_order_id` the cash is for that order (which must be this customer's); without it, it is account credit that settles the customer's oldest orders first. Closes delivered orders that are now fully covered and returns `settled_orders`. Never closes a PLACED/PACKED order. See 0021. |
 | `get_receipt(id)` | any member | Server decides what is on the receipt. |
 | `get_stock_snapshot()` | any member | Derived from the ledger every call. |
 | `get_customer_ledger(id)` | any member | The running khata. |
