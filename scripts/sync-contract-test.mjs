@@ -193,6 +193,8 @@ async function main() {
   const rawId = randomUUID();
   const custId = randomUUID();
   const ledgerId = randomUUID();
+  // Shared by section 9 (get_supplier must answer an owner) and section 18.
+  const supId = randomUUID();
 
   // The payload includes the fields a hostile client would try to control, plus
   // the _status/_changed keys WatermelonDB attaches to every raw record.
@@ -370,6 +372,11 @@ async function main() {
     check('...but cannot read any tenant data', false, 'skipped');
   }
 
+  // get_supplier needs a supplier to answer about. Created here so the read
+  // registry below can exercise it; section 18 then buys from it.
+  await rpc('upsert_supplier',
+    { p_id: supId, p_name: 'Contract Test Spice Traders', p_phone: '9800000011' }, tokenA);
+
   const READS = [
     ['list_customers', {}], ['list_suppliers', {}],
     ['list_raw_materials', {}], ['list_packed_skus', {}],
@@ -380,6 +387,8 @@ async function main() {
     ['get_order', { p_order_id: orderId }],
     ['get_customer_ledger', { p_customer_id: custId }],
     ['list_due_orders', {}],
+    ['list_customer_prices', { p_customer_id: custId }],
+    ['get_supplier', { p_supplier_id: supId }],
   ];
   let readsOk = true;
   const readFailures = [];
@@ -465,6 +474,17 @@ async function main() {
     ['set_order_due_date', { p_order_id: orderId, p_due_on: null }],
     ['set_customer_credit_days', { p_customer_id: custId, p_credit_days: 30 }],
     ['set_default_credit_days', { p_credit_days: 30 }],
+    ['list_customer_prices', { p_customer_id: custId }],
+    ['set_customer_price', { p_customer_id: custId, p_packed_sku_id: skuId, p_price: 1 }],
+    // The buying side, all OWNER-only since 0026.
+    ['get_supplier', { p_supplier_id: supId }],
+    ['upsert_supplier', { p_id: randomUUID(), p_name: 'Nope' }],
+    ['create_purchase', { p_purchase_id: randomUUID(), p_supplier_id: supId, p_items: [] }],
+    ['update_purchase', { p_purchase_id: randomUUID(), p_supplier_id: supId, p_items: [] }],
+    ['record_purchase_payment', { p_payment_id: randomUUID(), p_purchase_id: randomUUID(), p_amount: 1 }],
+    ['cancel_purchase', { p_purchase_id: randomUUID() }],
+    ['set_purchase_due_date', { p_purchase_id: randomUUID(), p_due_on: null }],
+    ['archive_master', { p_table: 'suppliers', p_id: supId }],
   ];
   const wronglyRefused = [];
   for (const [fn, args] of PACKER_ALLOWED) {
@@ -751,6 +771,14 @@ async function main() {
   // an order clears it. "Today" is the Indian calendar date.
   // =========================================================================
   console.log('\n14. Credit terms and due dates');
+  // app.local_today() is Asia/Kolkata, not UTC, so the dates these sections
+  // expect have to be too. Declared out here rather than inside section 14
+  // because section 18 needs the same calendar for purchase due dates.
+  const istDay = (offsetDays = 0) => {
+    const d = new Date(Date.now() + 5.5 * 3600 * 1000);
+    d.setUTCDate(d.getUTCDate() + offsetDays);
+    return d.toISOString().slice(0, 10);
+  };
   const dueCust = randomUUID();
   const plainCust = randomUUID();
   const defaultCust = randomUUID();
@@ -759,11 +787,6 @@ async function main() {
   let dueY = null;
   let yPaymentId = null;
   {
-    const istDay = (offsetDays = 0) => {
-      const d = new Date(Date.now() + 5.5 * 3600 * 1000);
-      d.setUTCDate(d.getUTCDate() + offsetDays);
-      return d.toISOString().slice(0, 10);
-    };
     await rpc('record_stock_adjustment',
       { p_entry_id: randomUUID(), p_item_kind: 'PACKED', p_item_id: skuId,
         p_mode: 'DELTA', p_qty: 20, p_note: 'due-date test stock' }, tokenA);
@@ -1031,6 +1054,487 @@ async function main() {
       JSON.stringify({ upiBefore, totalBefore, after }));
   }
 
+  // =========================================================================
+  // 17. Per-customer prices and price corrections (migration 0025).
+  //
+  // The owner keeps a rate per customer per SKU; create_order bills at it and
+  // falls back to the SKU's sale_price. A line's price can be corrected until
+  // the order is CLOSED, and every correction is logged. OWNER only.
+  // =========================================================================
+  console.log('\n17. Customer prices');
+  const priceCust = randomUUID();
+  const editCust = randomUUID();
+  {
+    await rpc('upsert_customer', { p_id: priceCust, p_name: `Rate Card ${Date.now()}` }, tokenA);
+    await rpc('upsert_customer', { p_id: editCust, p_name: `Price Edit ${Date.now()}` }, tokenA);
+    await rpc('record_stock_adjustment',
+      { p_entry_id: randomUUID(), p_item_kind: 'PACKED', p_item_id: skuId,
+        p_mode: 'DELTA', p_qty: 10, p_note: 'price test stock' }, tokenA);
+
+    const priceRow = async (customer) =>
+      (await rpc('list_customer_prices', { p_customer_id: customer }, tokenA)).body
+        ?.find((r) => r.packed_sku_id === skuId);
+    const getOrder = async (id, token = tokenA) => (await rpc('get_order', { p_order_id: id }, token)).body;
+    const place = async (customer, item) => {
+      const id = randomUUID();
+      const r = await rpc('create_order',
+        { p_order_id: id, p_customer_id: customer, p_items: [{ packed_sku_id: skuId, qty_packets: 2, ...item }] }, tokenA);
+      return { id, r };
+    };
+
+    let row = await priceRow(priceCust);
+    check('with no rate, a customer pays the SKU default',
+      Number(row?.price) === 60 && row?.customer_price === null && Number(row?.default_price) === 60,
+      JSON.stringify(row));
+
+    const set = await rpc('set_customer_price',
+      { p_customer_id: priceCust, p_packed_sku_id: skuId, p_price: 52 }, tokenA);
+    row = await priceRow(priceCust);
+    check('the owner can set a customer\'s rate',
+      set.ok && Number(row?.customer_price) === 52 && Number(row?.price) === 52, JSON.stringify([set.body, row]));
+    const setAgain = await rpc('set_customer_price',
+      { p_customer_id: priceCust, p_packed_sku_id: skuId, p_price: 52 }, tokenA);
+    check('setting the same rate again is harmless', setAgain.ok, JSON.stringify(setAgain.body));
+
+    const atRate = await place(priceCust, {});
+    let o = await getOrder(atRate.id);
+    check('an order without unit_price bills at the customer\'s rate',
+      Number(o?.items?.[0]?.unit_price) === 52 && Number(o?.order?.total_amount) === 104,
+      JSON.stringify(o?.items));
+
+    const override = await place(priceCust, { unit_price: 50 });
+    check('the owner can price a line by hand',
+      Number((await getOrder(override.id))?.items?.[0]?.unit_price) === 50, JSON.stringify(override.r.body));
+
+    await rpc('set_customer_price', { p_customer_id: priceCust, p_packed_sku_id: skuId, p_price: 55 }, tokenA);
+    check('changing a rate never reprices an order already taken',
+      Number((await getOrder(atRate.id))?.items?.[0]?.unit_price) === 52);
+
+    const cleared = await rpc('set_customer_price',
+      { p_customer_id: priceCust, p_packed_sku_id: skuId, p_price: null }, tokenA);
+    row = await priceRow(priceCust);
+    const afterClear = await place(priceCust, {});
+    check('clearing a rate falls back to the SKU default',
+      cleared.ok && row?.customer_price === null && Number(row?.price) === 60
+        && Number((await getOrder(afterClear.id))?.items?.[0]?.unit_price) === 60,
+      JSON.stringify([cleared.body, row]));
+
+    const negative = await rpc('set_customer_price',
+      { p_customer_id: priceCust, p_packed_sku_id: skuId, p_price: -1 }, tokenA);
+    check('a negative rate is refused', negative.body?.code === '22023', JSON.stringify(negative.body));
+
+    const bSet = await rpc('set_customer_price',
+      { p_customer_id: priceCust, p_packed_sku_id: skuId, p_price: 1 }, tokenB);
+    const bList = await rpc('list_customer_prices', { p_customer_id: priceCust }, tokenB);
+    check('B can neither set nor read A\'s rates',
+      bSet.body?.code === 'P0002' && bList.body?.code === 'P0002',
+      JSON.stringify([bSet.body?.code, bList.body?.code]));
+
+    // --- Corrections on an order that has gone out. ---
+    const e = await place(editCust, {});
+    await rpc('dispatch_order', { p_order_id: e.id }, tokenA);
+    await rpc('set_order_status', { p_order_id: e.id, p_status: 'DELIVERED' }, tokenA);
+    o = await getOrder(e.id);
+    const itemId = o?.items?.[0]?.id;
+    const outstanding = async () =>
+      Number((await rpc('get_customer_ledger', { p_customer_id: editCust }, tokenA)).body?.balance?.outstanding);
+    const owedBefore = await outstanding();
+    check('a delivered order offers edit_prices',
+      (o?.allowed_transitions ?? []).includes('edit_prices') && Number(o?.order?.total_amount) === 120,
+      JSON.stringify(o?.allowed_transitions));
+
+    const changeId = randomUUID();
+    const edit = await rpc('set_order_item_price',
+      { p_change_id: changeId, p_order_item_id: itemId, p_unit_price: 50, p_note: 'agreed discount' }, tokenA);
+    o = await getOrder(e.id);
+    check('the owner can correct a delivered line\'s price',
+      edit.ok && edit.body?.changed === true && Number(edit.body?.total_amount) === 100
+        && Number(o?.items?.[0]?.unit_price) === 50 && Number(o?.order?.total_amount) === 100
+        && Number(o?.balance) === 100,
+      JSON.stringify(edit.body));
+    check('...the khata moves with it', (await outstanding()) === owedBefore - 20,
+      `${owedBefore} -> ${await outstanding()}`);
+    check('...and the change is logged with its note',
+      o?.price_changes?.length === 1 && Number(o.price_changes[0].old_unit_price) === 60
+        && Number(o.price_changes[0].new_unit_price) === 50 && o.price_changes[0].note === 'agreed discount'
+        && typeof o.price_changes[0].changed_at === 'string',
+      JSON.stringify(o?.price_changes));
+
+    const retry = await rpc('set_order_item_price',
+      { p_change_id: changeId, p_order_item_id: itemId, p_unit_price: 50, p_note: 'agreed discount' }, tokenA);
+    const same = await rpc('set_order_item_price',
+      { p_change_id: randomUUID(), p_order_item_id: itemId, p_unit_price: 50 }, tokenA);
+    check('a retried or no-op correction changes nothing and logs nothing',
+      retry.body?.changed === false && same.body?.changed === false
+        && (await getOrder(e.id))?.price_changes?.length === 1,
+      JSON.stringify([retry.body, same.body]));
+
+    const badPrice = await rpc('set_order_item_price',
+      { p_change_id: randomUUID(), p_order_item_id: itemId, p_unit_price: -5 }, tokenA);
+    check('a negative price is refused', badPrice.body?.code === '22023', JSON.stringify(badPrice.body));
+
+    const pEdit = await rpc('set_order_item_price',
+      { p_change_id: randomUUID(), p_order_item_id: itemId, p_unit_price: 1 }, tokenP);
+    const bEdit = await rpc('set_order_item_price',
+      { p_change_id: randomUUID(), p_order_item_id: itemId, p_unit_price: 1 }, tokenB);
+    check('only A\'s owner can correct a price (packer 42501, B P0002)',
+      pEdit.body?.code === '42501' && bEdit.body?.code === 'P0002',
+      JSON.stringify([pEdit.body?.code, bEdit.body?.code]));
+
+    // A cut that clears the balance closes the order, like a payment would.
+    await rpc('record_payment',
+      { p_payment_id: randomUUID(), p_customer_id: editCust, p_amount: 90 }, tokenA);
+    const cut = await rpc('set_order_item_price',
+      { p_change_id: randomUUID(), p_order_item_id: itemId, p_unit_price: 45 }, tokenA);
+    o = await getOrder(e.id);
+    check('a cut that clears the balance closes the order',
+      cut.ok && o?.order?.status === 'CLOSED' && (cut.body?.settled_orders ?? []).includes(o?.order?.order_no),
+      JSON.stringify({ cut: cut.body, status: o?.order?.status }));
+
+    const locked = await rpc('set_order_item_price',
+      { p_change_id: randomUUID(), p_order_item_id: itemId, p_unit_price: 60 }, tokenA);
+    check('a closed order\'s prices are locked',
+      locked.body?.code === '22023' && locked.body?.hint === 'price_locked'
+        && !(o?.allowed_transitions ?? []).includes('edit_prices'),
+      JSON.stringify([locked.body, o?.allowed_transitions]));
+
+    const c = await place(editCust, {});
+    await rpc('set_order_status', { p_order_id: c.id, p_status: 'CANCELLED' }, tokenA);
+    const cItem = (await getOrder(c.id))?.items?.[0]?.id;
+    const onCancelled = await rpc('set_order_item_price',
+      { p_change_id: randomUUID(), p_order_item_id: cItem, p_unit_price: 1 }, tokenA);
+    check('a cancelled order\'s prices are locked',
+      onCancelled.body?.hint === 'price_locked', JSON.stringify(onCancelled.body));
+  }
+
+  // =========================================================================
+  // 18. Suppliers, purchases and what is owed to them (migration 0026).
+  //
+  // The buying side. Three things this section is really defending:
+  //   * stock moves by exactly the purchased quantity, once, and comes back
+  //     by exactly the same amount when the bill is cancelled;
+  //   * paid/balance are DERIVED, so the arithmetic has to hold after every
+  //     write without anything being stored;
+  //   * money paid OUT to a supplier never leaks into the customer books.
+  // =========================================================================
+  console.log('\n18. Suppliers, purchases and what is owed to them');
+  {
+    const purRaw = randomUUID();
+    await rpc('upsert_raw_material',
+      { p_id: purRaw, p_name: `Purchase Test Chilli ${Date.now()}` }, tokenA);
+
+    const getPurchase = async (id, token = tokenA) =>
+      (await rpc('get_purchase', { p_purchase_id: id }, token)).body;
+
+    const sup = await rpc('list_suppliers', {}, tokenA);
+    const supRow = (sup.body?.rows ?? []).find((r) => r.id === supId);
+    check('a new supplier starts owing nothing',
+      supRow?.purchase_count === 0 && Number(supRow?.outstanding) === 0,
+      JSON.stringify(supRow));
+
+    // 50 kg at 180/kg + 100 kg at 120/kg = 9,000 + 12,000 = 21,000.
+    // Grams and per-gram cost, which is what the wire carries.
+    const ITEMS = [
+      { raw_material_id: purRaw, qty_base: 50000, unit_cost_base: 0.18 },
+      { raw_material_id: rawId, qty_base: 100000, unit_cost_base: 0.12 },
+    ];
+    const EXPECTED_TOTAL = 21000;
+
+    const stockBefore = await onHandOf(purRaw);
+    const purId = randomUUID();
+    const made = await rpc('create_purchase',
+      { p_purchase_id: purId, p_supplier_id: supId, p_items: ITEMS,
+        p_invoice_no: 'INV-0026-1', p_due_on: istDay(15), p_receive: true }, tokenA);
+    check('a purchase totals qty x rate, server-side',
+      made.ok && Number(made.body?.total_amount) === EXPECTED_TOTAL,
+      JSON.stringify(made.body));
+
+    const p1 = await getPurchase(purId);
+    check('a received purchase is unpaid, numbered, and due when the bill says',
+      p1?.purchase?.status === 'RECEIVED' && typeof p1?.purchase?.purchase_no === 'number'
+        && p1?.payment_state === 'UNPAID' && Number(p1?.paid) === 0
+        && Number(p1?.balance) === EXPECTED_TOTAL
+        && p1?.purchase?.due_on === istDay(15)
+        && p1?.due_state === 'UPCOMING' && p1?.due_in_days === 15,
+      JSON.stringify({ status: p1?.purchase?.status, state: p1?.payment_state,
+        balance: p1?.balance, due: p1?.purchase?.due_on, ds: p1?.due_state }));
+
+    check('receiving a purchase raises raw stock by exactly what was bought',
+      (await onHandOf(purRaw)) === stockBefore + 50000,
+      `${await onHandOf(purRaw)} vs ${stockBefore + 50000}`);
+
+    const retry = await rpc('create_purchase',
+      { p_purchase_id: purId, p_supplier_id: supId, p_items: ITEMS, p_receive: true }, tokenA);
+    check('a retried purchase does not double-post its stock',
+      retry.body?.created === false && (await onHandOf(purRaw)) === stockBefore + 50000,
+      JSON.stringify(retry.body));
+
+    // ---- Paying for it, a bit at a time -------------------------------------
+    const payId = randomUUID();
+    const part = await rpc('record_purchase_payment',
+      { p_payment_id: payId, p_purchase_id: purId, p_amount: 10000,
+        p_method: 'UPI', p_reference: 'TXN-1234', p_note: 'first instalment' }, tokenA);
+    check('a partial payment leaves the bill part paid, with the arithmetic right',
+      part.ok && part.body?.payment_state === 'PARTIALLY_PAID'
+        && Number(part.body?.paid) === 10000
+        && Number(part.body?.balance) === EXPECTED_TOTAL - 10000,
+      JSON.stringify(part.body));
+
+    const p2 = await getPurchase(purId);
+    const first = (p2?.payments ?? [])[0];
+    check('the payment is in the history, with how it was paid and its reference',
+      (p2?.payments ?? []).length === 1 && first?.method === 'UPI'
+        && first?.reference === 'TXN-1234' && Number(first?.amount) === 10000
+        && typeof first?.paid_on === 'string',
+      JSON.stringify(p2?.payments));
+
+    const payRetry = await rpc('record_purchase_payment',
+      { p_payment_id: payId, p_purchase_id: purId, p_amount: 10000 }, tokenA);
+    const p3 = await getPurchase(purId);
+    check('a retried payment is not counted twice',
+      payRetry.body?.created === false && Number(payRetry.body?.paid) === 10000
+        && (p3?.payments ?? []).length === 1,
+      JSON.stringify({ retry: payRetry.body, n: (p3?.payments ?? []).length }));
+
+    const rest = await rpc('record_purchase_payment',
+      { p_payment_id: randomUUID(), p_purchase_id: purId,
+        p_amount: EXPECTED_TOTAL - 10000, p_method: 'CASH' }, tokenA);
+    check('settling the bill clears the balance and the due state together',
+      rest.ok && rest.body?.payment_state === 'PAID'
+        && Number(rest.body?.balance) === 0 && rest.body?.due_state === null,
+      JSON.stringify(rest.body));
+
+    // ---- Overdue is a date, not a payment level -----------------------------
+    const backId = randomUUID();
+    await rpc('record_purchase_payment',
+      { p_payment_id: backId, p_purchase_id: purId, p_amount: -5000,
+        p_note: 'supplier refunded a short delivery' }, tokenA);
+    const late = await rpc('set_purchase_due_date',
+      { p_purchase_id: purId, p_due_on: istDay(-3) }, tokenA);
+    const p4 = await getPurchase(purId);
+    check('a part-paid bill past its date is overdue AND still part paid',
+      late.ok && p4?.due_state === 'OVERDUE' && p4?.due_in_days === -3
+        && p4?.payment_state === 'PARTIALLY_PAID' && Number(p4?.balance) === 5000,
+      JSON.stringify({ ds: p4?.due_state, d: p4?.due_in_days,
+        ps: p4?.payment_state, bal: p4?.balance }));
+
+    check('a reversal is a new row, not an edit',
+      (p4?.payments ?? []).length === 3
+        && (p4?.payments ?? []).some((x) => Number(x.amount) === -5000),
+      JSON.stringify((p4?.payments ?? []).map((x) => x.amount)));
+
+    const tooMuch = await rpc('record_purchase_payment',
+      { p_payment_id: randomUUID(), p_purchase_id: purId, p_amount: -999999 }, tokenA);
+    check('you cannot reverse more than was ever paid',
+      tooMuch.body?.code === '23514', JSON.stringify(tooMuch.body));
+
+    // ---- Cancelling ---------------------------------------------------------
+    const blocked = await rpc('cancel_purchase', { p_purchase_id: purId }, tokenA);
+    check('a bill with money against it cannot be cancelled',
+      blocked.body?.code === '23514' && blocked.body?.hint === 'payments_exist'
+        && !(p4?.allowed_actions ?? []).includes('cancel'),
+      JSON.stringify({ body: blocked.body, actions: p4?.allowed_actions }));
+
+    // ---- Cancelling reverses the stock, exactly -----------------------------
+    const cancelRaw = randomUUID();
+    await rpc('upsert_raw_material',
+      { p_id: cancelRaw, p_name: `Cancel Test Jeera ${Date.now()}` }, tokenA);
+    const cancelBefore = await onHandOf(cancelRaw);
+    const cancelId = randomUUID();
+    await rpc('create_purchase',
+      { p_purchase_id: cancelId, p_supplier_id: supId,
+        p_items: [{ raw_material_id: cancelRaw, qty_base: 25000, unit_cost_base: 0.2 }],
+        p_receive: true }, tokenA);
+    check('the bill to be cancelled landed in stock first',
+      (await onHandOf(cancelRaw)) === cancelBefore + 25000);
+
+    const killed = await rpc('cancel_purchase',
+      { p_purchase_id: cancelId, p_reason: 'wrong goods delivered' }, tokenA);
+    const pc = await getPurchase(cancelId);
+    check('cancelling a received bill puts the stock back exactly',
+      killed.ok && killed.body?.cancelled === true && killed.body?.reversed_items === 1
+        && (await onHandOf(cancelRaw)) === cancelBefore
+        && pc?.purchase?.status === 'CANCELLED'
+        && typeof pc?.purchase?.cancelled_at === 'string'
+        && pc?.purchase?.cancel_reason === 'wrong goods delivered',
+      JSON.stringify({ body: killed.body, status: pc?.purchase?.status }));
+
+    const ledger = await rpc('list_stock_ledger', { p_raw_material_id: cancelRaw }, tokenA);
+    const reversal = (ledger.body?.rows ?? [])
+      .find((r) => r.ref_id === cancelId && Number(r.qty_base) < 0);
+    check('the reversal is a negative PURCHASE_IN still pointing at the bill',
+      reversal?.entry_type === 'PURCHASE_IN' && Number(reversal?.qty_base) === -25000
+        && reversal?.ref_type === 'PURCHASE',
+      JSON.stringify(reversal));
+
+    const again = await rpc('cancel_purchase', { p_purchase_id: cancelId }, tokenA);
+    check('cancelling twice does not take the stock out twice',
+      again.body?.already_cancelled === true && (await onHandOf(cancelRaw)) === cancelBefore,
+      JSON.stringify(again.body));
+
+    const onDead = await rpc('record_purchase_payment',
+      { p_payment_id: randomUUID(), p_purchase_id: cancelId, p_amount: 1 }, tokenA);
+    check('a cancelled bill takes no more money',
+      onDead.body?.hint === 'purchase_cancelled', JSON.stringify(onDead.body));
+
+    // Stock that has since left cannot be un-bought.
+    const goneRaw = randomUUID();
+    await rpc('upsert_raw_material',
+      { p_id: goneRaw, p_name: `Consumed Test ${Date.now()}` }, tokenA);
+    const goneId = randomUUID();
+    await rpc('create_purchase',
+      { p_purchase_id: goneId, p_supplier_id: supId,
+        p_items: [{ raw_material_id: goneRaw, qty_base: 5000, unit_cost_base: 0.1 }],
+        p_receive: true }, tokenA);
+    await rpc('record_stock_adjustment',
+      { p_entry_id: randomUUID(), p_item_kind: 'RAW', p_item_id: goneRaw,
+        p_mode: 'DELTA', p_qty: -4000, p_note: 'used in packing' }, tokenA);
+    const short = await rpc('cancel_purchase', { p_purchase_id: goneId }, tokenA);
+    check('a bill cannot be cancelled once its stock has been used',
+      short.body?.code === '23514' && (await onHandOf(goneRaw)) === 1000,
+      JSON.stringify(short.body));
+
+    // ---- A draft is a document; a received bill is frozen -------------------
+    const draftRaw = randomUUID();
+    await rpc('upsert_raw_material',
+      { p_id: draftRaw, p_name: `Draft Test Haldi ${Date.now()}` }, tokenA);
+    const draftBefore = await onHandOf(draftRaw);
+    const draftId = randomUUID();
+    await rpc('create_purchase',
+      { p_purchase_id: draftId, p_supplier_id: supId,
+        p_items: [{ raw_material_id: draftRaw, qty_base: 50000, unit_cost_base: 0.18 }],
+        p_receive: false }, tokenA);
+    const d1 = await getPurchase(draftId);
+    check('a draft posts nothing to stock and offers edit and receive',
+      d1?.purchase?.status === 'DRAFT' && (await onHandOf(draftRaw)) === draftBefore
+        && (d1?.allowed_actions ?? []).includes('edit')
+        && (d1?.allowed_actions ?? []).includes('receive'),
+      JSON.stringify({ status: d1?.purchase?.status, actions: d1?.allowed_actions }));
+
+    const edited = await rpc('update_purchase',
+      { p_purchase_id: draftId, p_supplier_id: supId,
+        p_items: [{ raw_material_id: draftRaw, qty_base: 40000, unit_cost_base: 0.18 }],
+        p_notes: 'corrected before it arrived' }, tokenA);
+    check('a draft can be corrected, and its total follows',
+      edited.ok && Number(edited.body?.total_amount) === 7200
+        && edited.body?.item_count === 1,
+      JSON.stringify(edited.body));
+
+    await rpc('receive_purchase', { p_purchase_id: draftId }, tokenA);
+    check('receiving posts the CORRECTED quantity, not the original',
+      (await onHandOf(draftRaw)) === draftBefore + 40000,
+      `${await onHandOf(draftRaw)} vs ${draftBefore + 40000}`);
+
+    const frozen = await rpc('update_purchase',
+      { p_purchase_id: draftId, p_supplier_id: supId,
+        p_items: [{ raw_material_id: draftRaw, qty_base: 1, unit_cost_base: 1 }] }, tokenA);
+    check('a received bill cannot be edited',
+      frozen.body?.code === '22023' && frozen.body?.hint === 'purchase_locked',
+      JSON.stringify(frozen.body));
+
+    // An advance on a draft is real money; the bill cannot be cut under it.
+    const advId = randomUUID();
+    await rpc('create_purchase',
+      { p_purchase_id: advId, p_supplier_id: supId,
+        p_items: [{ raw_material_id: draftRaw, qty_base: 10000, unit_cost_base: 1 }],
+        p_receive: false }, tokenA);
+    await rpc('record_purchase_payment',
+      { p_payment_id: randomUUID(), p_purchase_id: advId, p_amount: 6000,
+        p_note: 'advance' }, tokenA);
+    const cutUnder = await rpc('update_purchase',
+      { p_purchase_id: advId, p_supplier_id: supId,
+        p_items: [{ raw_material_id: draftRaw, qty_base: 1000, unit_cost_base: 1 }] }, tokenA);
+    check('a draft cannot be cut below what has already been paid on it',
+      cutUnder.body?.code === '23514' && cutUnder.body?.hint === 'below_paid',
+      JSON.stringify(cutUnder.body));
+
+    // ---- The supplier relationship adds up ---------------------------------
+    const detail = await rpc('get_supplier', { p_supplier_id: supId }, tokenA);
+    const t = detail.body?.totals;
+    const listed = ((await rpc('list_suppliers', {}, tokenA)).body?.rows ?? [])
+      .find((r) => r.id === supId);
+    check('get_supplier and list_suppliers agree on what is owed',
+      detail.ok && Number(t?.outstanding) === Number(listed?.outstanding)
+        && Number(t?.total_billed) === Number(listed?.total_billed)
+        && Number(t?.total_paid) === Number(listed?.total_paid),
+      JSON.stringify({ totals: t, row: listed }));
+
+    check('a supplier is owed exactly what was billed less what was paid',
+      Math.abs(Number(t?.total_billed) - Number(t?.total_paid) - Number(t?.outstanding)) < 0.005,
+      JSON.stringify(t));
+
+    check('the supplier carries a page of their own bills',
+      Array.isArray(detail.body?.purchases?.rows)
+        && typeof detail.body?.purchases?.has_more === 'boolean'
+        && detail.body.purchases.rows.every((r) => r.supplier_id === supId),
+      JSON.stringify(detail.body?.purchases?.limit));
+
+    check('an overdue bill is counted as overdue on the supplier',
+      Number(t?.overdue_count) >= 1 && Number(t?.overdue_amount) >= 5000,
+      JSON.stringify({ n: t?.overdue_count, amount: t?.overdue_amount }));
+
+    // A cancelled bill is neither owed nor settled -- it must not read as PAID.
+    const cancelledRow = (await rpc('list_purchases', {}, tokenA)).body?.rows
+      ?.find((r) => r.id === cancelId);
+    check('a cancelled bill reports no payment state rather than looking paid',
+      cancelledRow?.payment_state === null && Number(cancelledRow?.balance) === 0
+        && cancelledRow?.status === 'CANCELLED',
+      JSON.stringify(cancelledRow));
+
+    // ---- Money paid OUT is not money taken IN ------------------------------
+    // get_day_summary is require_member(), so a packer reads it. Supplier
+    // payables must never appear there, and this is the assertion that stops
+    // someone later "helpfully" merging the two ledgers.
+    const dayBefore = (await rpc('get_day_summary', {}, tokenA)).body;
+    const outId = randomUUID();
+    await rpc('record_purchase_payment',
+      { p_payment_id: outId, p_purchase_id: purId, p_amount: 1000, p_method: 'CASH' }, tokenA);
+    const dayAfter = (await rpc('get_day_summary', {}, tokenA)).body;
+    const dayBook = (await rpc('list_payments', {}, tokenA)).body?.rows ?? [];
+    check('paying a supplier does not touch the day\'s collections',
+      Number(dayBefore?.cash_collected) === Number(dayAfter?.cash_collected)
+        && Number(dayBefore?.collected_cash) === Number(dayAfter?.collected_cash)
+        && !dayBook.some((p) => p.id === outId),
+      JSON.stringify({ before: dayBefore?.cash_collected, after: dayAfter?.cash_collected }));
+
+    // ---- Another shop cannot see or touch any of it ------------------------
+    const crossRefused = [];
+    for (const [fn, args] of [
+      ['get_supplier', { p_supplier_id: supId }],
+      ['get_purchase', { p_purchase_id: purId }],
+      ['record_purchase_payment', { p_payment_id: randomUUID(), p_purchase_id: purId, p_amount: 1 }],
+      ['cancel_purchase', { p_purchase_id: draftId }],
+      ['set_purchase_due_date', { p_purchase_id: purId, p_due_on: null }],
+      ['update_purchase', { p_purchase_id: purId, p_supplier_id: null,
+        p_items: [{ raw_material_id: purRaw, qty_base: 1, unit_cost_base: 1 }] }],
+      ['archive_master', { p_table: 'suppliers', p_id: supId }],
+    ]) {
+      const r = await rpc(fn, args, tokenB);
+      // archive_master answers rather than raising; it must simply match nothing.
+      const refused = fn === 'archive_master' ? r.body?.archived === false : !r.ok;
+      if (!refused) crossRefused.push(`${fn} -> ${r.status} ${JSON.stringify(r.body)}`);
+    }
+    check('another shop cannot read or move any of this',
+      crossRefused.length === 0, crossRefused.join('; '));
+
+    const bSees = await rpc('list_purchases', {}, tokenB);
+    const bSups = await rpc('list_suppliers', {}, tokenB);
+    check('another shop sees none of these bills or suppliers',
+      !(bSees.body?.rows ?? []).some((r) => r.supplier_id === supId)
+        && !(bSups.body?.rows ?? []).some((r) => r.id === supId),
+      JSON.stringify({ p: bSees.body?.rows?.length, s: bSups.body?.rows?.length }));
+
+    // The append-only rule, from the outside: there is no RPC that edits or
+    // deletes a payment, so the only way to correct one is another row.
+    check('nothing in the API can rewrite a supplier payment',
+      (await getPurchase(purId))?.payments?.length === 4,
+      JSON.stringify((await getPurchase(purId))?.payments?.map((x) => x.amount)));
+
+    for (const id of [purRaw, cancelRaw, goneRaw, draftRaw]) {
+      await rpc('archive_master', { p_table: 'raw_materials', p_id: id }, tokenA);
+    }
+  }
+
   console.log('\n13. Cleanup');
   {
     const archived = [];
@@ -1043,6 +1547,9 @@ async function main() {
       ['customers', dueCust],
       ['customers', plainCust],
       ['customers', defaultCust],
+      ['customers', priceCust],
+      ['customers', editCust],
+      ['suppliers', supId],
     ]) {
       const res = await rpc('archive_master', { p_table: table, p_id: id }, tokenA);
       if (res.ok && res.body?.archived) archived.push(table);

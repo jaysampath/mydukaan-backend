@@ -138,18 +138,23 @@ without doing this.
 | `sync_push(changes, last_pulled_at)` | any member | Deliberately **not** subscription-gated — see below. |
 | `bootstrap_business(name, owner)` | any authed user | Creates tenant + OWNER profile. Idempotent. |
 | `update_business_settings(...)` | OWNER | Includes the GSTIN toggle. Never paywalled. |
-| `receive_purchase(id)` | OWNER, MANAGER | Writes `PURCHASE_IN` rows. |
+| `receive_purchase(id)` | OWNER | Writes `PURCHASE_IN` rows. OWNER-only since 0026. |
 | `run_conversion(id)` | OWNER, MANAGER, PACKER | `PACK_OUT` + `PACK_IN` in one transaction. |
-| `create_order(id, customer, items)` | OWNER, MANAGER | Prices from the SKU unless overridden. |
+| `create_order(id, customer, items)` | OWNER, MANAGER | Each line bills at the customer's rate (`app.customer_prices`), else the SKU's sale price (0025). A line `unit_price` is accepted from the OWNER only; anyone else sending one gets `42501`. |
 | `dispatch_order(id)` | OWNER, MANAGER, DELIVERY | **Stock leaves here**, not at order confirmation. |
 | `set_order_status(id, status)` | any member | Cannot reach `OUT_FOR_DELIVERY` or `CLOSED`. |
 | `record_payment(...)` | OWNER, MANAGER, DELIVERY | Appends. `p_method` is CASH or UPI (0024), defaulting to CASH so older builds record cash; it is recorded, never verified. With `p_order_id` the cash is for that order (which must be this customer's); without it, it is account credit that settles the customer's oldest orders first. Closes delivered orders that are now fully covered and returns `settled_orders`. Never closes a PLACED/PACKED order. See 0021. |
 | `get_receipt(id)` | any member | Server decides what is on the receipt. |
 | `get_stock_snapshot()` | any member | Derived from the ledger every call. |
 | `get_customer_ledger(id)` | any member | The running khata. |
-| `upsert_customer/supplier/raw_material/packed_sku` | OWNER, MANAGER | 0011. Upserts: the client mints the id, so create and edit are one call. |
-| `archive_master(table, id)` | OWNER, MANAGER | Soft. History keeps referencing the row. |
-| `create_purchase(...)` | OWNER, MANAGER | 0011. Creates lines and posts through `receive_purchase`. |
+| `upsert_customer/raw_material/packed_sku` | OWNER, MANAGER | 0011. Upserts: the client mints the id, so create and edit are one call. |
+| `upsert_supplier(...)` | OWNER | 0011, OWNER-only since 0026: a supplier is the other end of a cost. |
+| `archive_master(table, id)` | OWNER, MANAGER | Soft. History keeps referencing the row. `p_table = 'suppliers'` is OWNER-only (0026), so a manager cannot archive what they can no longer see. |
+| `create_purchase(...)` | OWNER | 0011. Creates lines and posts through `receive_purchase`. 0026 added `p_due_on` (DROP-then-create; the grants had to be re-issued) and made it OWNER-only. |
+| `update_purchase(...)` | OWNER | 0026. DRAFT only -- a received bill has `PURCHASE_IN` rows standing (hint `purchase_locked`). Replaces the whole line set, soft-deleting the old lines, and refuses a total below what is already paid (hint `below_paid`). |
+| `record_purchase_payment(...)` | OWNER | 0026. Append-only, always against one bill. Signed: a wrong entry or a refund is corrected by a NEGATIVE row, never an edit. CASH or UPI, recorded and never verified -- there is no gateway. Idempotent on the payment id. Overpayment is allowed. |
+| `cancel_purchase(id, reason)` | OWNER | 0026. The reversal RPC. Posts NEGATIVE `PURCHASE_IN` rows (not `ADJUSTMENT`, so the posting and its reversal stay linked by `ref_id`). Refuses if payments do not net to zero (hint `payments_exist`) or if reversing would drive any material's stock negative (`23514`, checked across every line before a single insert). Idempotent. |
+| `set_purchase_due_date(id, on)` | OWNER | 0026. null clears. Refused on a cancelled bill (hint `not_due`). A purchase's due date is TYPED from the supplier's bill, not derived from terms -- there is no `suppliers.credit_days`. |
 | `create_packing_run(...)` | OWNER, MANAGER, PACKER | 0012. Derives wastage; refuses a run that would conjure stock. |
 | `schema_contract()` / `describe_sync_schema()` | any / anon | 0009-0010. The client compatibility contract. |
 | `claim_invite(token, name)` | any authed user | 0014. Attaches a user to a business. Enforces `seat_limit`. |
@@ -160,6 +165,22 @@ without doing this.
 | `list_due_orders(scope)` | OWNER, MANAGER, DELIVERY | 0022. Live orders with a balance and a due date, soonest first, plus `summary` counts. Overdue is derived, against `app.local_today()` (IST). |
 | `authorize_voucher_upload` / `attach_voucher_photo` | OWNER | 0023. Called by the voucher Worker with the caller's JWT, around its R2 put. Idempotent on the photo id. |
 | `get_voucher_photo(id)` / `hide_voucher_photo(id)` | OWNER | 0023. The Worker's read check; hide is a soft delete. See ADR 0004 (mobile repo). |
+| `list_customer_prices(customer)` | OWNER, MANAGER | 0025. Every active SKU with `default_price`, the customer's `customer_price` (null if none) and the effective `price`. |
+| `set_customer_price(customer, sku, price)` | OWNER | 0025. The rate card. null clears (soft delete). Keyed on (customer, SKU), so a retry is harmless. Never reprices an order already taken. |
+| `set_order_item_price(change_id, item, price, note)` | OWNER | 0025. Corrects one line's price on an order that is not CLOSED or CANCELLED (hint `price_locked`). Idempotent on `change_id`. Logs old/new/who/when/note in `app.order_price_changes` (append-only, forbid_mutation triggers, no UPDATE grant), recomputes `total_amount`, and settles through `app.settle_customer_orders`. `get_order` offers `edit_prices` and returns `price_changes`. |
+| `list_suppliers(search)` | OWNER | 0017, OWNER-only since 0026, when each row gained `purchase_count`, `total_billed`, `total_paid` and `outstanding` from `app.v_supplier_balances`. |
+| `list_purchases(...)` | OWNER | 0017, OWNER-only since 0026. Rows gained `paid`, `balance`, `payment_state`, `due_on`, `due_state`, `due_in_days` and `cancelled_at`. Signature unchanged on purpose -- no server-side state filter, because that would mean DROP-then-create for something the screen can do over a 200-row page. |
+| `get_purchase(id)` | OWNER | 0017, OWNER-only since 0026. Additive: the payment history (with `recorded_by_name`), the derived summary, and **`allowed_actions`** -- `edit` / `receive` / `record_payment` / `set_due_date` / `cancel`, resolved server-side so no screen re-derives the rules. `cancel` is withheld once any money stands against the bill. |
+| `get_supplier(id, limit, offset)` | OWNER | 0026. The supplier, their totals (billed / paid / outstanding / overdue count and amount) and a page of their bills in the standard envelope. `P0002` for an id in another tenant, so ids cannot be probed. |
+
+A purchase carries TWO orthogonal answers, never one combined status
+(0026). `payment_state` is `UNPAID` / `PARTIALLY_PAID` / `PAID`; `due_state` is
+`app.due_state(due_on, balance)`, the same function orders use. Overdue is a
+date condition, not a payment level, and the row that matters most -- the
+half-paid bill that was due last week -- is both at once. Because
+`app.due_state` answers null at a balance of zero or less, a paid bill can
+never read overdue, so there is no precedence rule to get wrong and no second
+definition of "today".
 
 Every operation takes the record's UUID **from the caller**, so a phone that
 loses signal mid-call can retry safely. `dispatch_order` called twice deducts

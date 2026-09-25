@@ -47,6 +47,22 @@ select * from (
          case when has_table_privilege('app_api','app.orders','DELETE')
               then 'ALLOWED (BAD)' else 'DENIED (good)' end
   union all
+  -- The price-correction log is append-only (0025).
+  select 'app_api can update app.order_price_changes',
+         case when has_table_privilege('app_api','app.order_price_changes','UPDATE')
+              then 'ALLOWED (BAD)' else 'DENIED (good)' end
+  union all
+  -- Supplier payments are append-only (0026). 0005's `alter default
+  -- privileges` grants app_api UPDATE on every new app table, so this asserts
+  -- the migration took it back.
+  select 'app_api can update app.purchase_payments',
+         case when has_table_privilege('app_api','app.purchase_payments','UPDATE')
+              then 'ALLOWED (BAD)' else 'DENIED (good)' end
+  union all
+  select 'app_api can delete app.purchase_payments',
+         case when has_table_privilege('app_api','app.purchase_payments','DELETE')
+              then 'ALLOWED (BAD)' else 'DENIED (good)' end
+  union all
   select 'app_api has BYPASSRLS',
          case when exists (select 1 from pg_roles where rolname='app_api' and rolbypassrls)
               then 'YES (BAD)' else 'NO (good)' end
@@ -229,3 +245,12 @@ order by 1,2;
 
 -- 3k. The GSTIN toggle is free and works: with show_gstin_on_receipt false the
 --     receipt''s business.gstin is null; with it true the GSTIN appears.
+
+-- 3l. A supplier payment cannot be rewritten (run as postgres, 0026).
+--     Expected: 42501 app.purchase_payments is append-only
+-- update app.purchase_payments set amount = 1 where id = '<a payment id>';
+
+-- 3m. Cancelling a received purchase reverses its stock exactly. Note the
+--     on-hand figure, cancel_purchase(id), and the figure must return to what
+--     it was before the bill was received -- via a NEGATIVE PURCHASE_IN row,
+--     not an ADJUSTMENT, and not by rewriting the original.
